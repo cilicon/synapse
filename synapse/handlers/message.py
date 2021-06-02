@@ -19,6 +19,7 @@ from typing import TYPE_CHECKING, Any, Dict, List, Mapping, Optional, Tuple
 
 from canonicaljson import encode_canonical_json
 
+from twisted.internet import defer
 from twisted.internet.interfaces import IDelayedCall
 
 from synapse import event_auth
@@ -43,14 +44,15 @@ from synapse.events import EventBase
 from synapse.events.builder import EventBuilder
 from synapse.events.snapshot import EventContext
 from synapse.events.validator import EventValidator
-from synapse.logging.context import run_in_background
+from synapse.logging.context import make_deferred_yieldable, run_in_background
 from synapse.metrics.background_process_metrics import run_as_background_process
 from synapse.replication.http.send_event import ReplicationSendEventRestServlet
 from synapse.storage.databases.main.events_worker import EventRedactBehaviour
 from synapse.storage.state import StateFilter
 from synapse.types import Requester, RoomAlias, StreamToken, UserID, create_requester
-from synapse.util import json_decoder, json_encoder
-from synapse.util.async_helpers import Linearizer
+from synapse.util import json_decoder, json_encoder, log_failure
+from synapse.util.async_helpers import Linearizer, unwrapFirstError
+from synapse.util.caches.expiringcache import ExpiringCache
 from synapse.util.metrics import measure_func
 from synapse.visibility import filter_events_for_client
 
@@ -258,7 +260,7 @@ class MessageHandler:
                     "Getting joined members after leaving is not implemented"
                 )
 
-        users_with_profile = await self.state.get_current_users_in_room(room_id)
+        users_with_profile = await self.store.get_users_in_room_with_profiles(room_id)
 
         # If this is an AS, double check that they are allowed to see the members.
         # This can either be because the AS user is in the room or because there
@@ -456,6 +458,19 @@ class EventCreationHandler:
         self._ephemeral_events_enabled = hs.config.enable_ephemeral_messages
 
         self._external_cache = hs.get_external_cache()
+
+        # Stores the state groups we've recently added to the joined hosts
+        # external cache. Note that the timeout must be significantly less than
+        # the TTL on the external cache.
+        self._external_cache_joined_hosts_updates = (
+            None
+        )  # type: Optional[ExpiringCache]
+        if self._external_cache.is_enabled():
+            self._external_cache_joined_hosts_updates = ExpiringCache(
+                "_external_cache_joined_hosts_updates",
+                self.clock,
+                expiry_ms=30 * 60 * 1000,
+            )
 
     async def create_event(
         self,
@@ -965,9 +980,43 @@ class EventCreationHandler:
             logger.exception("Failed to encode content: %r", event.content)
             raise
 
-        await self.action_generator.handle_push_actions_for_event(event, context)
+        # We now persist the event (and update the cache in parallel, since we
+        # don't want to block on it).
+        result = await make_deferred_yieldable(
+            defer.gatherResults(
+                [
+                    run_in_background(
+                        self._persist_event,
+                        requester=requester,
+                        event=event,
+                        context=context,
+                        ratelimit=ratelimit,
+                        extra_users=extra_users,
+                    ),
+                    run_in_background(
+                        self.cache_joined_hosts_for_event, event, context
+                    ).addErrback(log_failure, "cache_joined_hosts_for_event failed"),
+                ],
+                consumeErrors=True,
+            )
+        ).addErrback(unwrapFirstError)
 
-        await self.cache_joined_hosts_for_event(event)
+        return result[0]
+
+    async def _persist_event(
+        self,
+        requester: Requester,
+        event: EventBase,
+        context: EventContext,
+        ratelimit: bool = True,
+        extra_users: Optional[List[UserID]] = None,
+    ) -> EventBase:
+        """Actually persists the event. Should only be called by
+        `handle_new_client_event`, and see its docstring for documentation of
+        the arguments.
+        """
+
+        await self.action_generator.handle_push_actions_for_event(event, context)
 
         try:
             # If we're a worker we need to hit out to the master.
@@ -1008,13 +1057,18 @@ class EventCreationHandler:
             await self.store.remove_push_actions_from_staging(event.event_id)
             raise
 
-    async def cache_joined_hosts_for_event(self, event: EventBase) -> None:
+    async def cache_joined_hosts_for_event(
+        self, event: EventBase, context: EventContext
+    ) -> None:
         """Precalculate the joined hosts at the event, when using Redis, so that
         external federation senders don't have to recalculate it themselves.
         """
 
         if not self._external_cache.is_enabled():
             return
+
+        # If external cache is enabled we should always have this.
+        assert self._external_cache_joined_hosts_updates is not None
 
         # We actually store two mappings, event ID -> prev state group,
         # state group -> joined hosts, which is much more space efficient
@@ -1023,28 +1077,36 @@ class EventCreationHandler:
         # Note: We have to cache event ID -> prev state group, as we don't
         # store that in the DB.
         #
-        # Note: We always set the state group -> joined hosts cache, even if
-        # we already set it, so that the expiry time is reset.
+        # Note: We set the state group -> joined hosts cache if it hasn't been
+        # set for a while, so that the expiry time is reset.
 
         state_entry = await self.state.resolve_state_groups_for_events(
             event.room_id, event_ids=event.prev_event_ids()
         )
 
         if state_entry.state_group:
-            joined_hosts = await self.store.get_joined_hosts(event.room_id, state_entry)
-
             await self._external_cache.set(
                 "event_to_prev_state_group",
                 event.event_id,
                 state_entry.state_group,
                 expiry_ms=60 * 60 * 1000,
             )
+
+            if state_entry.state_group in self._external_cache_joined_hosts_updates:
+                return
+
+            joined_hosts = await self.store.get_joined_hosts(event.room_id, state_entry)
+
+            # Note that the expiry times must be larger than the expiry time in
+            # _external_cache_joined_hosts_updates.
             await self._external_cache.set(
                 "get_joined_hosts",
                 str(state_entry.state_group),
                 list(joined_hosts),
                 expiry_ms=60 * 60 * 1000,
             )
+
+            self._external_cache_joined_hosts_updates[state_entry.state_group] = None
 
     async def _validate_canonical_alias(
         self, directory_handler, room_alias_str: str, expected_room_id: str

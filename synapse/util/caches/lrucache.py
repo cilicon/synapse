@@ -32,8 +32,35 @@ from typing import (
 from typing_extensions import Literal
 
 from synapse.config import cache as cache_config
+from synapse.util import caches
 from synapse.util.caches import CacheMetric, register_cache
-from synapse.util.caches.treecache import TreeCache
+from synapse.util.caches.treecache import TreeCache, iterate_tree_cache_entry
+
+try:
+    from pympler.asizeof import Asizer
+
+    def _get_size_of(val: Any, *, recurse=True) -> int:
+        """Get an estimate of the size in bytes of the object.
+
+        Args:
+            val: The object to size.
+            recurse: If true will include referenced values in the size,
+                otherwise only sizes the given object.
+        """
+        # Ignore singleton values when calculating memory usage.
+        if val in ((), None, ""):
+            return 0
+
+        sizer = Asizer()
+        sizer.exclude_refs((), None, "")
+        return sizer.asizeof(val, limit=100 if recurse else 0)
+
+
+except ImportError:
+
+    def _get_size_of(val: Any, *, recurse=True) -> int:
+        return 0
+
 
 # Function type: the type used for invalidation callbacks
 FT = TypeVar("FT", bound=Callable[..., Any])
@@ -56,7 +83,7 @@ def enumerate_leaves(node, depth):
 
 
 class _Node:
-    __slots__ = ["prev_node", "next_node", "key", "value", "callbacks"]
+    __slots__ = ["prev_node", "next_node", "key", "value", "callbacks", "memory"]
 
     def __init__(
         self,
@@ -83,6 +110,16 @@ class _Node:
         self.callbacks = None  # type: Optional[List[Callable[[], None]]]
 
         self.add_callbacks(callbacks)
+
+        self.memory = 0
+        if caches.TRACK_MEMORY_USAGE:
+            self.memory = (
+                _get_size_of(key)
+                + _get_size_of(value)
+                + _get_size_of(self.callbacks, recurse=False)
+                + _get_size_of(self, recurse=False)
+            )
+            self.memory += _get_size_of(self.memory, recurse=False)
 
     def add_callbacks(self, callbacks: Collection[Callable[[], None]]) -> None:
         """Add to stored list of callbacks, removing duplicates."""
@@ -115,7 +152,6 @@ class LruCache(Generic[KT, VT]):
     """
     Least-recently-used cache, supporting prometheus metrics and invalidation callbacks.
 
-    Supports del_multi only if cache_type=TreeCache
     If cache_type=TreeCache, all keys must be tuples.
     """
 
@@ -123,7 +159,6 @@ class LruCache(Generic[KT, VT]):
         self,
         max_size: int,
         cache_name: Optional[str] = None,
-        keylen: int = 1,
         cache_type: Type[Union[dict, TreeCache]] = dict,
         size_callback: Optional[Callable] = None,
         metrics_collection_callback: Optional[Callable[[], None]] = None,
@@ -135,9 +170,6 @@ class LruCache(Generic[KT, VT]):
 
             cache_name: The name of this cache, for the prometheus metrics. If unset,
                 no metrics will be reported on this cache.
-
-            keylen: The length of the tuple used as the cache key. Ignored unless
-                cache_type is `TreeCache`.
 
             cache_type (type):
                 type of underlying cache to be used. Typically one of dict
@@ -233,6 +265,9 @@ class LruCache(Generic[KT, VT]):
             if size_callback:
                 cached_cache_len[0] += size_callback(node.value)
 
+            if caches.TRACK_MEMORY_USAGE and metrics:
+                metrics.inc_memory_usage(node.memory)
+
         def move_node_to_front(node):
             prev_node = node.prev_node
             next_node = node.next_node
@@ -257,6 +292,9 @@ class LruCache(Generic[KT, VT]):
                 cached_cache_len[0] -= deleted_len
 
             node.run_and_clear_callbacks()
+
+            if caches.TRACK_MEMORY_USAGE and metrics:
+                metrics.dec_memory_usage(node.memory)
 
             return deleted_len
 
@@ -354,13 +392,21 @@ class LruCache(Generic[KT, VT]):
 
         @synchronized
         def cache_del_multi(key: KT) -> None:
+            """Delete an entry, or tree of entries
+
+            If the LruCache is backed by a regular dict, then "key" must be of
+            the right type for this cache
+
+            If the LruCache is backed by a TreeCache, then "key" must be a tuple, but
+            may be of lower cardinality than the TreeCache - in which case the whole
+            subtree is deleted.
             """
-            This will only work if constructed with cache_type=TreeCache
-            """
-            popped = cache.pop(key)
+            popped = cache.pop(key, None)
             if popped is None:
                 return
-            for leaf in enumerate_leaves(popped, keylen - len(cast(tuple, key))):
+            # for each deleted node, we now need to remove it from the linked list
+            # and run its callbacks.
+            for leaf in iterate_tree_cache_entry(popped):
                 delete_node(leaf)
 
         @synchronized
@@ -372,6 +418,9 @@ class LruCache(Generic[KT, VT]):
             cache.clear()
             if size_callback:
                 cached_cache_len[0] = 0
+
+            if caches.TRACK_MEMORY_USAGE and metrics:
+                metrics.clear_memory_usage()
 
         @synchronized
         def cache_contains(key: KT) -> bool:
@@ -386,11 +435,10 @@ class LruCache(Generic[KT, VT]):
         self.set = cache_set
         self.setdefault = cache_set_default
         self.pop = cache_pop
+        self.del_multi = cache_del_multi
         # `invalidate` is exposed for consistency with DeferredCache, so that it can be
         # invalidated by the cache invalidation replication stream.
-        self.invalidate = cache_pop
-        if cache_type is TreeCache:
-            self.del_multi = cache_del_multi
+        self.invalidate = cache_del_multi
         self.len = synchronized(cache_len)
         self.contains = cache_contains
         self.clear = cache_clear
